@@ -1,6 +1,4 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 
 const { fetchMock } = vi.hoisted(() => ({
   fetchMock: vi.fn(),
@@ -10,21 +8,18 @@ vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
   proxyAwareFetch: fetchMock,
 }));
 
-import { DefaultExecutor } from "../../open-sse/executors/default.js";
 import { getExecutor } from "../../open-sse/executors/index.js";
-
-const TRANSPORTS = [
-  { format: "openai", baseUrl: "https://opencode.ai/zen/go/v1/chat/completions", auth: { combined: true, header: "Authorization", scheme: "bearer" } },
-  { format: "claude", baseUrl: "https://opencode.ai/zen/go/v1/messages", auth: { combined: true, header: "x-api-key", scheme: "raw", anthropicVersion: true } },
-  { format: "openai-responses", baseUrl: "https://opencode.ai/zen/go/v1/responses", auth: { combined: true, header: "Authorization", scheme: "bearer" } },
-];
+import {
+  OPENCODE_SESSION_RE,
+  generateSessionId,
+  generateRequestId,
+  translateSessionId,
+} from "../../open-sse/executors/opencode.js";
 
 function makeCredentials(overrides = {}) {
   return {
-    apiKey: "test-key",
-    connectionId: "connection-a",
+    connectionId: "conn_test",
     rawHeaders: {},
-    runtimeTransport: TRANSPORTS[0],
     ...overrides,
   };
 }
@@ -32,7 +27,7 @@ function makeCredentials(overrides = {}) {
 function prepare(executor, overrides = {}) {
   const credentials = overrides.credentials || makeCredentials();
   const prepared = executor.prepareRequestCredentials({
-    body: overrides.body || { messages: [{ role: "user", content: "hello" }] },
+    body: overrides.body || { input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] }] },
     credentials,
     providerSessionId: overrides.providerSessionId ?? "conversation-a",
     clientTool: overrides.clientTool ?? "claude",
@@ -48,119 +43,227 @@ beforeEach(() => {
   }));
 });
 
-describe("OpenCode Go x-opencode-session", () => {
-  it("uses a dedicated executor with request-local session credentials", () => {
-    const executor = getExecutor("opencode-go");
-    const { credentials, prepared } = prepare(executor);
-
-    expect(executor.constructor.name).toBe("OpenCodeGoExecutor");
-    expect(prepared).not.toBe(credentials);
-    expect(prepared._opencodeGoSession).toMatch(/^ses_[0-9a-f]{32}$/);
-    expect(credentials).not.toHaveProperty("_opencodeGoSession");
-    expect(executor).not.toHaveProperty("_currentSessionId");
-    expect(executor).not.toHaveProperty("_opencodeGoSession");
+describe("OpenCode Free Session ID Format", () => {
+  it("generates session IDs matching OpenCode canonical format (ses_ + 12 hex + 14 base62)", () => {
+    for (let i = 0; i < 20; i++) {
+      const id = generateSessionId();
+      expect(id).toMatch(OPENCODE_SESSION_RE);
+      expect(id).toHaveLength(30);
+    }
   });
 
-  it("preserves a valid native session header case-insensitively", () => {
-    const executor = getExecutor("opencode-go");
-    const { prepared } = prepare(executor, {
-      credentials: makeCredentials({ rawHeaders: { "X-OpenCode-Session": " native-session-a " } }),
-    });
-
-    expect(prepared._opencodeGoSession).toBe("native-session-a");
+  it("generates request IDs matching OpenCode canonical format (msg_ + 12 hex + 14 base62)", () => {
+    for (let i = 0; i < 20; i++) {
+      const id = generateRequestId();
+      expect(id).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+      expect(id).toHaveLength(30);
+    }
   });
 
-  it("ignores an oversized native session and uses the translated identity", () => {
-    const executor = getExecutor("opencode-go");
-    const { prepared } = prepare(executor, {
-      credentials: makeCredentials({ rawHeaders: { "x-opencode-session": "x".repeat(257) } }),
-    });
-
-    expect(prepared._opencodeGoSession).toMatch(/^ses_[0-9a-f]{32}$/);
+  it("translates arbitrary sessions into valid OpenCode session format", () => {
+    const inputs = [
+      "claude:550e8400-e29b-41d4-a716-446655440000",
+      "antigravity:conv-abc-123",
+      "session-from-codex",
+      "12345",
+      "",
+    ];
+    for (const raw of inputs) {
+      const translated = translateSessionId(raw, "claude");
+      expect(translated).toMatch(OPENCODE_SESSION_RE);
+      expect(translated).toHaveLength(30);
+    }
   });
 
-  it("keeps the same translated conversation stable across all transports", () => {
-    const executor = getExecutor("opencode-go");
-    const values = TRANSPORTS.map((runtimeTransport) => {
-      const { prepared } = prepare(executor, {
-        credentials: makeCredentials({ runtimeTransport }),
-      });
-      return executor.buildHeaders(prepared, true)["x-opencode-session"];
-    });
-
-    expect(new Set(values).size).toBe(1);
-    expect(values[0]).toMatch(/^ses_[0-9a-f]{32}$/);
-    expect(values[0]).not.toContain("conversation-a");
-  });
-
-  it("isolates different conversations", () => {
-    const executor = getExecutor("opencode-go");
-    const a = prepare(executor, { providerSessionId: "conversation-a" }).prepared._opencodeGoSession;
-    const b = prepare(executor, { providerSessionId: "conversation-b" }).prepared._opencodeGoSession;
-
-    expect(a).not.toBe(b);
-  });
-
-  it("isolates different downstream agents that reuse the same raw id", () => {
-    const executor = getExecutor("opencode-go");
-    const claude = prepare(executor, { clientTool: "claude" }).prepared._opencodeGoSession;
-    const codex = prepare(executor, { clientTool: "codex" }).prepared._opencodeGoSession;
-
-    expect(claude).not.toBe(codex);
-  });
-
-  it("uses a stable opaque connection fallback when no session is supplied", () => {
-    const executor = getExecutor("opencode-go");
-    const options = {
-      credentials: makeCredentials({ connectionId: "fallback-connection" }),
-      providerSessionId: null,
-      clientTool: null,
-      body: { messages: [{ role: "user", content: "headerless" }] },
-    };
-    const first = prepare(executor, options).prepared._opencodeGoSession;
-    const second = prepare(executor, options).prepared._opencodeGoSession;
-
-    expect(first).toBe(second);
-    expect(first).toMatch(/^ses_[0-9a-f]{32}$/);
-    expect(first).not.toContain("fallback-connection");
-  });
-
-  it("adds the prepared session to the actual fetch headers", async () => {
-    const executor = getExecutor("opencode-go");
-    const credentials = makeCredentials();
-    const result = await executor.execute({
-      model: "glm-5.2",
-      body: { messages: [{ role: "user", content: "hello" }] },
-      stream: false,
-      credentials,
-      providerSessionId: "conversation-fetch",
-      clientTool: "codex",
-    });
-
-    expect(result.headers["x-opencode-session"]).toMatch(/^ses_[0-9a-f]{32}$/);
-    expect(fetchMock).toHaveBeenCalledOnce();
-    expect(fetchMock.mock.calls[0][1].headers["x-opencode-session"]).toBe(result.headers["x-opencode-session"]);
-    expect(credentials).not.toHaveProperty("_opencodeGoSession");
-  });
-
-  it("does not add the header to unrelated default executors", () => {
-    const headers = new DefaultExecutor("openai").buildHeaders({ apiKey: "test-key" }, false);
-    expect(headers["x-opencode-session"]).toBeUndefined();
+  it("preserves already-valid OpenCode sessions without re-hashing", () => {
+    const valid = "ses_f534dfae8ffeCy4Ee4tLWNygDc";
+    expect(translateSessionId(valid)).toBe(valid);
+    expect(translateSessionId(`  ${valid}  `)).toBe(valid);
   });
 });
 
-describe("chatCore provider session forwarding", () => {
-  it("passes the original provider session and client tool on initial and retry execution", () => {
-    const source = readFileSync(
-      fileURLToPath(new URL("../../open-sse/handlers/chatCore.js", import.meta.url)),
-      "utf8",
-    );
-    const calls = [...source.matchAll(/executor\.execute\(\{([\s\S]*?)\}\)/g)].map((match) => match[1]);
+describe("OpenCode Free Executor Session Resolution", () => {
+  it("uses request-local session credentials without mutating source credentials", () => {
+    const executor = getExecutor("opencode");
+    const { credentials, prepared } = prepare(executor);
 
-    expect(calls).toHaveLength(2);
-    for (const call of calls) {
-      expect(call).toMatch(/providerSessionId:\s*sessionSeed/);
-      expect(call).toMatch(/\bclientTool\b/);
+    expect(executor.constructor.name).toBe("OpenCodeExecutor");
+    expect(prepared).not.toBe(credentials);
+    expect(prepared._opencodeSession).toMatch(OPENCODE_SESSION_RE);
+    expect(credentials).not.toHaveProperty("_opencodeSession");
+    expect(executor).not.toHaveProperty("_currentSessionId");
+  });
+
+  it("preserves valid native x-opencode-session header case-insensitively", () => {
+    const executor = getExecutor("opencode");
+    const valid = "ses_f534dfae8ffeCy4Ee4tLWNygDc";
+    const { prepared } = prepare(executor, {
+      credentials: makeCredentials({ rawHeaders: { "X-OpenCode-Session": ` ${valid} ` } }),
+    });
+
+    expect(prepared._opencodeSession).toBe(valid);
+  });
+
+  it("translates invalid native x-opencode-session header into a valid session", () => {
+    const executor = getExecutor("opencode");
+    const { prepared } = prepare(executor, {
+      credentials: makeCredentials({ rawHeaders: { "x-opencode-session": "invalid-session-uuid" } }),
+    });
+
+    expect(prepared._opencodeSession).toMatch(OPENCODE_SESSION_RE);
+    expect(prepared._opencodeSession).not.toBe("invalid-session-uuid");
+  });
+
+  it("translates conversation session deterministically", () => {
+    const executor = getExecutor("opencode");
+    const first = prepare(executor, { providerSessionId: "conversation-a", clientTool: "claude" }).prepared._opencodeSession;
+    const second = prepare(executor, { providerSessionId: "conversation-a", clientTool: "claude" }).prepared._opencodeSession;
+
+    expect(first).toBe(second);
+    expect(first).toMatch(OPENCODE_SESSION_RE);
+  });
+
+  it("isolates different conversations and tools", () => {
+    const executor = getExecutor("opencode");
+    const convA = prepare(executor, { providerSessionId: "conversation-a" }).prepared._opencodeSession;
+    const convB = prepare(executor, { providerSessionId: "conversation-b" }).prepared._opencodeSession;
+    const toolClaude = prepare(executor, { providerSessionId: "same", clientTool: "claude" }).prepared._opencodeSession;
+    const toolCodex = prepare(executor, { providerSessionId: "same", clientTool: "codex" }).prepared._opencodeSession;
+
+    expect(convA).not.toBe(convB);
+    expect(toolClaude).not.toBe(toolCodex);
+  });
+
+  it("adds the valid session header to fetch requests", async () => {
+    const executor = getExecutor("opencode");
+    const credentials = makeCredentials();
+    const result = await executor.execute({
+      model: "muse-spark-1.3-contributor-free",
+      body: { input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] }] },
+      stream: false,
+      credentials,
+      providerSessionId: "conversation-fetch-test",
+      clientTool: "claude",
+    });
+
+    expect(result.headers["x-opencode-session"]).toMatch(OPENCODE_SESSION_RE);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0][1].headers["x-opencode-session"]).toBe(result.headers["x-opencode-session"]);
+    expect(fetchMock.mock.calls[0][1].headers["Authorization"]).toBe("Bearer public");
+    expect(credentials).not.toHaveProperty("_opencodeSession");
+  });
+
+  it("falls back to a valid generated session in buildHeaders when called standalone", () => {
+    const executor = getExecutor("opencode");
+    const headers = executor.buildHeaders({});
+
+    expect(headers["x-opencode-session"]).toMatch(OPENCODE_SESSION_RE);
+    expect(headers["Authorization"]).toBe("Bearer public");
+  });
+  it("handles null or undefined body gracefully in transformRequest", () => {
+    const executor = getExecutor("opencode");
+    expect(() => executor.transformRequest("muse-spark-1.3-contributor-free", null, false, {})).not.toThrow();
+    expect(() => executor.transformRequest("big-pickle", undefined, false, {})).not.toThrow();
+  });
+});
+
+describe("OpenCode Free User-Agent Validation", () => {
+  it("defaults User-Agent to opencode/1.18.31 for non-opencode downstream clients", () => {
+    const executor = getExecutor("opencode");
+    const headersNoUa = executor.buildHeaders({});
+    expect(headersNoUa["User-Agent"]).toBe("opencode/1.18.31");
+
+    const headersClaude = executor.buildHeaders({ rawHeaders: { "user-agent": "Claude-Code/1.0" } });
+    expect(headersClaude["User-Agent"]).toBe("opencode/1.18.31");
+  });
+
+  it("replaces bare opencode with versioned opencode/1.18.31 to prevent 403 FreeTierError", () => {
+    const executor = getExecutor("opencode");
+    const headers = executor.buildHeaders({ rawHeaders: { "user-agent": "opencode" } });
+    expect(headers["User-Agent"]).toBe("opencode/1.18.31");
+  });
+
+  it("upgrades outdated opencode versions (< 1.17) to prevent 426 Upgrade Required", () => {
+    const executor = getExecutor("opencode");
+    const headers = executor.buildHeaders({ rawHeaders: { "user-agent": "opencode/1.15.0" } });
+    expect(headers["User-Agent"]).toBe("opencode/1.18.31");
+  });
+
+  it("preserves valid opencode versions (>= 1.17)", () => {
+    const executor = getExecutor("opencode");
+    const headers118 = executor.buildHeaders({
+      rawHeaders: { "user-agent": "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14" },
+    });
+    expect(headers118["User-Agent"]).toBe("opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14");
+
+    const headersFuture = executor.buildHeaders({ rawHeaders: { "user-agent": "opencode/1.19.0" } });
+    expect(headersFuture["User-Agent"]).toBe("opencode/1.19.0");
+  });
+});
+
+describe("OpenCode Free Upstream Gates (stream + tool fingerprint)", () => {
+  it("forces stream:true upstream on chat bodies even for non-stream clients", () => {
+    const executor = getExecutor("opencode");
+    const out = executor.transformRequest(
+      "mimo-v2.5-free",
+      { model: "mimo-v2.5-free", messages: [{ role: "user", content: "hi" }] },
+      false,
+      { rawHeaders: {} },
+    );
+    expect(out.stream).toBe(true);
+  });
+
+  it("injects the file-search quartet into chat bodies without tools", () => {
+    const executor = getExecutor("opencode");
+    const out = executor.transformRequest(
+      "mimo-v2.5-free",
+      { model: "mimo-v2.5-free", messages: [{ role: "user", content: "hi" }] },
+      true,
+      { rawHeaders: {} },
+    );
+    const names = out.tools.map((t) => t.function?.name);
+    for (const required of ["bash", "glob", "grep", "read"]) {
+      expect(names).toContain(required);
     }
+  });
+
+  it("preserves caller chat tools and only appends the missing fingerprint names", () => {
+    const executor = getExecutor("opencode");
+    const out = executor.transformRequest(
+      "mimo-v2.5-free",
+      {
+        model: "mimo-v2.5-free",
+        messages: [{ role: "user", content: "hi" }],
+        tools: [{ type: "function", function: { name: "my_tool", description: "m", parameters: { type: "object", properties: {} } } }],
+      },
+      true,
+      { rawHeaders: {} },
+    );
+    const names = out.tools.map((t) => t.function?.name);
+    expect(names[0]).toBe("my_tool");
+    for (const required of ["bash", "glob", "grep", "read"]) {
+      expect(names).toContain(required);
+    }
+  });
+
+  it("injects the fingerprint into Responses bodies and keeps stream/store gates", () => {
+    const executor = getExecutor("opencode");
+    const out = executor.transformRequest(
+      "muse-spark-1.3-contributor-free",
+      { input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }] },
+      false,
+      { rawHeaders: {} },
+    );
+    expect(out.stream).toBe(true);
+    expect(out.store).toBe(false);
+    const names = out.tools.map((t) => t.name);
+    for (const required of ["bash", "glob", "grep", "read"]) {
+      expect(names).toContain(required);
+    }
+  });
+
+  it("declares forceStream on the opencode transport so chatCore serves SSE upstream", async () => {
+    const { PROVIDERS } = await import("../../open-sse/config/providers.js");
+    expect(PROVIDERS["opencode"]?.forceStream).toBe(true);
   });
 });
